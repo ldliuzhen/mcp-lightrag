@@ -12,7 +12,9 @@ def get_settings() -> ServerSettings:
     return ServerSettings(
         host=os.environ.get("LIGHTRAG_HOST", "localhost"),
         port=int(os.environ.get("LIGHTRAG_PORT", 9621)),
-        api_key=os.environ.get("LIGHTRAG_API_KEY", "")
+        api_key=os.environ.get("LIGHTRAG_API_KEY", ""),
+        api_key_header=os.environ.get("LIGHTRAG_API_KEY_HEADER", "Authorization"),
+        api_key_prefix=os.environ.get("LIGHTRAG_API_KEY_PREFIX", "Bearer")
     )
 
 # Default configuration instance

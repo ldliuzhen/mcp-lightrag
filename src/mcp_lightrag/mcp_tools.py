@@ -18,6 +18,12 @@ from .client.light_rag_server_api_client.models import QueryRequest, QueryReques
 
 logger = logging.getLogger(__name__)
 
+QUERY_MODE_ALIASES = {
+    "semantic": "naive",
+    "vector": "naive",
+    "keyword": "hybrid",
+}
+
 class AppContext:
     """Type-safe application context."""
     def __init__(self, client: LightRAGApiClient):
@@ -55,6 +61,15 @@ async def get_api(ctx: Context) -> LightRAGApiClient:
         raise RuntimeError("Application context not initialized")
     return cast(AppContext, ctx.request_context.lifespan_context).api
 
+def normalize_query_mode(search_mode: str) -> QueryRequestMode:
+    """Normalize old MCP aliases to modes supported by current LightRAG APIs."""
+    normalized = QUERY_MODE_ALIASES.get(search_mode.strip().lower(), search_mode.strip().lower())
+    try:
+        return QueryRequestMode(normalized)
+    except ValueError as exc:
+        valid_modes = ", ".join(mode.value for mode in QueryRequestMode)
+        raise ValueError(f"Unsupported search_mode '{search_mode}'. Use one of: {valid_modes}") from exc
+
 # --- Search & Query Tools ---
 
 @mcp.tool(name="query_knowledge_graph", description="Search the knowledge graph for information using various strategies. Ideal for answering questions based on indexed data.")
@@ -63,7 +78,7 @@ async def query_knowledge_graph(
     ctx: Context,
     prompt: str = Field(description="The question or search query to execute against the knowledge base"),
     search_mode: str = Field(
-        description="Search strategy to use: 'mix' (recommended for comprehensive results), 'semantic' (vector search), 'keyword' (exact match), 'global' (broad context), 'hybrid' (semantic + keyword), 'local' (specific context), 'naive' (simple)",
+        description="Search strategy to use: 'mix' (recommended), 'local', 'global', 'hybrid', 'naive' (vector-only), or 'bypass'. Deprecated aliases: 'semantic' -> 'naive', 'keyword' -> 'hybrid'.",
         default="mix"
     ),
     limit: int = Field(description="Maximum number of result items/paragraphs to retrieve", default=60),
@@ -74,16 +89,17 @@ async def query_knowledge_graph(
     api = await get_api(ctx)
     params = QueryRequest(
         query=prompt,
-        mode=QueryRequestMode(search_mode),
+        mode=normalize_query_mode(search_mode),
         top_k=limit,
+        chunk_top_k=limit,
         only_need_context=context_only,
         only_need_prompt=prompt_only,
-        # Sensible defaults for other params
         response_type="Multiple Paragraphs",
-        max_token_for_text_unit=4096,
-        max_token_for_global_context=4096,
-        max_token_for_local_context=4096,
-        history_turns=10
+        max_entity_tokens=4096,
+        max_relation_tokens=4096,
+        max_total_tokens=12288,
+        stream=False,
+        include_references=True
     )
     return await api.query(params)
 
@@ -210,19 +226,28 @@ async def verify_server_health(ctx: Context) -> Any:
 @format_output
 async def create_entities(
     ctx: Context,
-    entities: List[Dict[str, Any]] = Field(description="List of entity dictionaries. Each must contain: 'name', 'type', 'description', 'source_id'")
+    entities: List[Dict[str, Any]] = Field(description="List of entity dictionaries. Each must contain 'name'. Optional fields include 'type'/'entity_type', 'description', and 'source_id'.")
 ) -> Any:
     api = await get_api(ctx)
     results = []
     for e in entities:
         try:
+            name = e.get("name") or e.get("entity_name")
+            if not name:
+                raise ValueError("entity must include 'name'")
+
+            extra_data = {
+                k: v for k, v in e.items()
+                if k not in {"name", "entity_name", "type", "entity_type", "description", "source_id"}
+            }
             res = await api.create_entity(
-                name=str(e['name']), 
-                type=str(e['type']), 
-                description=str(e['description']), 
-                source_id=str(e['source_id'])
+                name=str(name),
+                type=str(e.get("entity_type", e.get("type"))) if e.get("entity_type", e.get("type")) is not None else None,
+                description=str(e["description"]) if e.get("description") is not None else None,
+                source_id=str(e["source_id"]) if e.get("source_id") is not None else None,
+                extra_data=extra_data
             )
-            results.append({"name": e['name'], "status": "ok", "data": res})
+            results.append({"name": name, "status": "ok", "data": res})
         except Exception as err:
             results.append({"name": e.get('name', 'unknown'), "status": "fail", "error": str(err)})
     
@@ -275,15 +300,29 @@ async def modify_entities(
     results = []
     for e in entities:
         try:
+            name = e.get("name") or e.get("entity_name")
+            if not name:
+                raise ValueError("entity must include 'name'")
+
+            extra_data = {
+                k: v for k, v in e.items()
+                if k not in {
+                    "name", "entity_name", "type", "entity_type", "description",
+                    "source_id", "allow_rename", "allow_merge"
+                }
+            }
             res = await api.edit_entity(
-                name=str(e['name']),
-                type=str(e['type']),
-                description=str(e['description']),
-                source_id=str(e['source_id'])
+                name=str(name),
+                type=str(e.get("entity_type", e.get("type"))) if e.get("entity_type", e.get("type")) is not None else None,
+                description=str(e["description"]) if e.get("description") is not None else None,
+                source_id=str(e["source_id"]) if e.get("source_id") is not None else None,
+                extra_data=extra_data,
+                allow_rename=bool(e.get("allow_rename", False)),
+                allow_merge=bool(e.get("allow_merge", False))
             )
-            results.append({"name": e['name'], "status": "ok", "data": res})
+            results.append({"name": name, "status": "ok", "data": res})
         except Exception as err:
-            results.append({"name": e['name'], "status": "fail", "error": str(err)})
+            results.append({"name": e.get("name", "unknown"), "status": "fail", "error": str(err)})
     return results
 
 @mcp.tool(name="connect_entities", description="Define or update relationships between entities, including edge weights and descriptions.")
@@ -299,8 +338,8 @@ async def connect_entities(
             res = await api.manage_relation(
                 source=str(r['source']),
                 target=str(r['target']),
-                description=str(r['description']),
-                keywords=str(r['keywords']),
+                description=str(r.get('description', '')),
+                keywords=str(r.get('keywords', r.get('type', ''))),
                 relation_type=r.get('type'),
                 source_id=r.get('source_id'),
                 weight=r.get('weight'),

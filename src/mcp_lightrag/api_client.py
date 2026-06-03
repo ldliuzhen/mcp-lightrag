@@ -85,10 +85,12 @@ def with_retry(max_retries: int = 3, base_delay: float = 1.0):
             for attempt in range(max_retries):
                 try:
                     return await func(*args, **kwargs)
-                except (httpx.ConnectError, httpx.TimeoutException, UnexpectedStatus) as e:
+                except (httpx.ConnectError, httpx.TimeoutException, UnexpectedStatus, APIConnectionError, APIResponseError) as e:
                     last_exception = e
                     # Don't retry on certain status codes if it's an UnexpectedStatus
                     if isinstance(e, UnexpectedStatus) and e.status_code in [400, 401, 403, 404]:
+                        raise
+                    if isinstance(e, APIResponseError) and e.status_code in [400, 401, 403, 404, 422]:
                         raise
                     
                     delay = base_delay * (2 ** attempt)
@@ -119,13 +121,17 @@ class LightRAGApiClient:
             self.client = AuthenticatedClient(
                 base_url=settings.base_url, 
                 token=settings.api_key, 
-                verify_ssl=False
+                prefix=settings.api_key_prefix,
+                auth_header_name=settings.api_key_header,
+                verify_ssl=False,
+                raise_on_unexpected_status=True
             )
         else:
             from .client.light_rag_server_api_client.client import Client
             self.client = Client(
                 base_url=settings.base_url,
-                verify_ssl=False
+                verify_ssl=False,
+                raise_on_unexpected_status=True
             )
         logger.info(f"Connected to LightRAG API at {settings.base_url}")
 
@@ -140,13 +146,36 @@ class LightRAGApiClient:
         try:
             logger.debug(f"Starting operation: {name}")
             result = await api_func(client=self.client, **kwargs)
+            self._raise_for_error_response(result, name)
             return result
+        except APIResponseError:
+            raise
         except UnexpectedStatus as e:
             logger.error(f"API Error ({name}): {e.status_code} - {e.content!r}")
             raise APIResponseError(f"API operation '{name}' failed", status_code=e.status_code, details=str(e.content))
-        except Exception as e:
+        except httpx.RequestError as e:
             logger.error(f"Unexpected error during {name}: {str(e)}")
             raise APIConnectionError(f"Failed to connect for '{name}'") from e
+        except Exception:
+            logger.exception(f"Unexpected error during {name}")
+            raise
+
+    @staticmethod
+    def _raise_for_error_response(result: Any, name: str) -> None:
+        """Raise for generated error models returned on documented error statuses."""
+        class_name = result.__class__.__name__ if result is not None else ""
+        is_error_model = class_name == "HTTPValidationError" or re.search(r"Response[45]\d\d$", class_name)
+        if not is_error_model:
+            return
+
+        status_match = re.search(r"Response([45]\d\d)$", class_name)
+        status_code = int(status_match.group(1)) if status_match else 422
+        details = result.to_dict() if hasattr(result, "to_dict") else result
+        raise APIResponseError(
+            f"API operation '{name}' returned an error response",
+            status_code=status_code,
+            details=str(details)
+        )
 
     # --- Document Operations ---
 
@@ -320,13 +349,24 @@ class LightRAGApiClient:
         """Get labels from the knowledge graph."""
         return await self._execute_op(async_get_graph_labels, "get_labels")
 
-    async def create_entity(self, name: str, type: str, description: str, source_id: str) -> Any:
+    async def create_entity(
+        self,
+        name: str,
+        type: Optional[str] = None,
+        description: Optional[str] = None,
+        source_id: Optional[str] = None,
+        extra_data: Optional[Dict[str, Any]] = None
+    ) -> Any:
         """Add a new entity to the knowledge graph."""
-        data = EntityCreateRequestEntityData.from_dict({
-            "entity_type": type, 
-            "description": description, 
-            "source_id": source_id
-        })
+        entity_data = dict(extra_data or {})
+        if type is not None:
+            entity_data["entity_type"] = type
+        if description is not None:
+            entity_data["description"] = description
+        if source_id is not None:
+            entity_data["source_id"] = source_id
+
+        data = EntityCreateRequestEntityData.from_dict(entity_data)
         body = EntityCreateRequest(entity_name=name, entity_data=data)
         return await self._execute_op(async_create_entity, f"create_entity_{name}", body=body)
 
@@ -340,14 +380,32 @@ class LightRAGApiClient:
         body = DeleteDocRequest(doc_ids=[doc_id])
         return await self._execute_op(async_delete_by_doc_id, f"delete_doc_{doc_id}", body=body)
 
-    async def edit_entity(self, name: str, type: str, description: str, source_id: str) -> Any:
+    async def edit_entity(
+        self,
+        name: str,
+        type: Optional[str] = None,
+        description: Optional[str] = None,
+        source_id: Optional[str] = None,
+        extra_data: Optional[Dict[str, Any]] = None,
+        allow_rename: bool = False,
+        allow_merge: bool = False
+    ) -> Any:
         """Update an existing entity."""
-        data = EntityUpdateRequestUpdatedData.from_dict({
-            "entity_type": type, 
-            "description": description, 
-            "source_id": source_id
-        })
-        body = EntityUpdateRequest(entity_name=name, updated_data=data)
+        entity_data = dict(extra_data or {})
+        if type is not None:
+            entity_data["entity_type"] = type
+        if description is not None:
+            entity_data["description"] = description
+        if source_id is not None:
+            entity_data["source_id"] = source_id
+
+        data = EntityUpdateRequestUpdatedData.from_dict(entity_data)
+        body = EntityUpdateRequest(
+            entity_name=name,
+            updated_data=data,
+            allow_rename=allow_rename,
+            allow_merge=allow_merge
+        )
         return await self._execute_op(async_edit_entity, f"edit_entity_{name}", body=body)
 
     async def merge_entities(self, sources: List[str], target: str, strategy: Dict[str, str]) -> Any:
@@ -365,14 +423,22 @@ class LightRAGApiClient:
         """Create or update a relationship between entities."""
         
         if is_edit:
-            data = RelationUpdateRequestUpdatedData.from_dict({
+            relation_data = {
                 "description": description,
                 "keywords": keywords,
                 "weight": weight
-            })
+            }
+            if relation_type is not None:
+                relation_data["relation_type"] = relation_type
+            if source_id is not None:
+                relation_data["source_id"] = source_id
+
+            data = RelationUpdateRequestUpdatedData.from_dict(
+                {k: v for k, v in relation_data.items() if v is not None}
+            )
             body = RelationUpdateRequest(
-                source_entity=source,
-                target_entity=target,
+                source_id=source,
+                target_id=target,
                 updated_data=data
             )
             return await self._execute_op(
@@ -381,12 +447,18 @@ class LightRAGApiClient:
                 body=body
             )
         else:
-            data = RelationCreateRequestRelationData.from_dict({
+            relation_data = {
                 "description": description,
                 "keywords": keywords,
                 "weight": weight,
                 "source_id": source_id
-            })
+            }
+            if relation_type is not None:
+                relation_data["relation_type"] = relation_type
+
+            data = RelationCreateRequestRelationData.from_dict(
+                {k: v for k, v in relation_data.items() if v is not None}
+            )
             body = RelationCreateRequest(
                 source_entity=source,
                 target_entity=target,
