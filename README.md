@@ -7,7 +7,7 @@
 ## 功能特性
 
 - **智能更新**：通过 `upsert` 检测文档变化，未变化时跳过，变化后删除旧版本并重新上传。
-- **知识图谱查询**：支持当前 LightRAG 查询模式：`mix`、`local`、`global`、`hybrid`、`naive`、`bypass`。
+- **知识图谱查询**：默认使用 `auto` 智能策略，也支持当前 LightRAG 查询模式：`mix`、`local`、`global`、`hybrid`、`naive`、`bypass`。
 - **文档导入**：支持导入文本、文件和目录批量扫描。
 - **实体管理**：支持创建、修改、合并和删除知识图谱实体。
 - **关系管理**：支持创建和更新实体之间的关系。
@@ -45,25 +45,47 @@ uv sync
 
 | 选项 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- | --- |
+| `--url` | `LIGHTRAG_URL` | 无 | LightRAG API 完整地址，例如 `http://localhost:9621` |
 | `--host` | `LIGHTRAG_HOST` | `localhost` | LightRAG API 主机 |
 | `--port` | `LIGHTRAG_PORT` | `9621` | LightRAG API 端口 |
-| `--api-key` | `LIGHTRAG_API_KEY` | 无 | 可选 API key 或 token |
-| 仅环境变量 | `LIGHTRAG_API_KEY_HEADER` | `Authorization` | 认证 header 名称，例如 `X-API-Key` |
-| 仅环境变量 | `LIGHTRAG_API_KEY_PREFIX` | `Bearer` | 认证前缀；若使用裸 API key header，可设置为空字符串 |
+| `--api-key` | `LIGHTRAG_API_KEY` | 无 | 可选 API key；默认通过 `X-API-Key` 发送 |
+| `--username` | `LIGHTRAG_USERNAME` | 无 | 可选 LightRAG 登录用户名；未配置 API key 时使用 |
+| `--password` | `LIGHTRAG_PASSWORD` | 无 | 可选 LightRAG 登录密码；未配置 API key 时使用 |
+| 仅环境变量 | `LIGHTRAG_API_KEY_HEADER` | `X-API-Key` | 认证 header 名称；如果使用 OAuth token，可改为 `Authorization` |
+| 仅环境变量 | `LIGHTRAG_API_KEY_PREFIX` | 空字符串 | 认证前缀；如果使用 OAuth token，可改为 `Bearer` |
 | `--log-level` | 无 | `INFO` | 日志级别 |
 
-默认认证方式为：
+默认静态 API key 认证方式为：
 
 ```http
-Authorization: Bearer <LIGHTRAG_API_KEY>
+X-API-Key: <LIGHTRAG_API_KEY>
 ```
 
-如果你的 LightRAG 部署使用 `X-API-Key`，可以这样配置：
+如果你使用的是 LightRAG `/login` 返回的 OAuth token，而不是静态 API key，可以改成 Bearer 方式：
 
 ```bash
-LIGHTRAG_API_KEY=your_api_key
-LIGHTRAG_API_KEY_HEADER=X-API-Key
-LIGHTRAG_API_KEY_PREFIX=
+LIGHTRAG_API_KEY=your_oauth_token
+LIGHTRAG_API_KEY_HEADER=Authorization
+LIGHTRAG_API_KEY_PREFIX=Bearer
+```
+
+如果你没有静态 API key，但可以登录 WebUI，可以配置用户名和密码。MCP 会先调用 `/login` 获取 Bearer token：
+
+```bash
+LIGHTRAG_USERNAME=your_username
+LIGHTRAG_PASSWORD=your_password
+```
+
+如果 WebUI 地址是 `http://server-ip:9621`，MCP 也应连接同一个 base URL。推荐直接配置：
+
+```bash
+LIGHTRAG_URL=http://server-ip:9621
+```
+
+或者在启动参数中使用：
+
+```bash
+uv run mcp-lightrag --url http://server-ip:9621
 ```
 
 ## 配置为 MCP Server
@@ -80,13 +102,13 @@ LIGHTRAG_API_KEY_PREFIX=
         "/absolute/path/to/mcp-lightrag",
         "run",
         "mcp-lightrag",
-        "--host",
-        "localhost",
-        "--port",
-        "9621"
+        "--url",
+        "http://localhost:9621"
       ],
       "env": {
-        "LIGHTRAG_API_KEY": "optional_api_key"
+        "LIGHTRAG_API_KEY": "your_api_key",
+        "LIGHTRAG_API_KEY_HEADER": "X-API-Key",
+        "LIGHTRAG_API_KEY_PREFIX": ""
       }
     }
   }
@@ -105,11 +127,79 @@ LIGHTRAG_API_KEY_PREFIX=
 
 这种机制让 AI 助手可以高效维护一批持续变化的知识文档。
 
+## 查询策略
+
+`query_knowledge_graph` 的 `search_mode` 默认值是 `auto`。在这个模式下，MCP 会根据问题类型选择一组 LightRAG 查询模式，并在返回“暂无足够信息”等保守回答时自动换下一个模式重试。
+
+调用方大模型也可以自行指定查询策略：
+
+- `mix`：通用问答，优先推荐给大多数问题。
+- `local`：实体、关系、路径、图谱关联类问题。
+- `global`：总结、概括、对比、影响、趋势类问题。
+- `hybrid`：关键词和语义混合检索。
+- `naive`：原文片段、出处、关键词命中、纯向量检索。
+- `bypass`：绕过检索，直接调用后端生成能力。
+
+如果不确定，用 `auto`；如果大模型已经能判断任务类型，可以显式传入对应模式。
+
+## 常见故障
+
+### 健康检查通过，但其他工具全部失败
+
+如果 `verify_server_health` 成功，但 `query_knowledge_graph`、`get_latest_documents`、`ingest_text` 等工具失败，通常不是服务没启动，而是认证没有配置好。
+
+原因是 `/health` 通常是公开端点，而查询、文档、图谱和写入接口一般需要认证。请确认 MCP 配置里设置了正确的 token 或 API key：
+
+```json
+"env": {
+  "LIGHTRAG_URL": "http://server-ip:9621",
+  "LIGHTRAG_API_KEY": "your_api_key",
+  "LIGHTRAG_API_KEY_HEADER": "X-API-Key",
+  "LIGHTRAG_API_KEY_PREFIX": ""
+}
+```
+
+如果没有 API key，也可以改用登录账号：
+
+```json
+"env": {
+  "LIGHTRAG_URL": "http://server-ip:9621",
+  "LIGHTRAG_USERNAME": "your_username",
+  "LIGHTRAG_PASSWORD": "your_password"
+}
+```
+
+默认静态 API key 发送方式是：
+
+```http
+X-API-Key: <LIGHTRAG_API_KEY>
+```
+
+如果你的 `LIGHTRAG_API_KEY` 实际上是 OAuth Bearer token，请改为：
+
+```json
+"env": {
+  "LIGHTRAG_API_KEY": "your_oauth_token",
+  "LIGHTRAG_API_KEY_HEADER": "Authorization",
+  "LIGHTRAG_API_KEY_PREFIX": "Bearer"
+}
+```
+
+### 图谱元数据或索引状态返回 500/503
+
+如果 `query_knowledge_graph`、`ingest_text`、`create_entities` 等核心功能正常，但 `get_graph_metadata` 或 `check_indexing_status` 返回 500/503，通常不是 MCP 请求格式错误，而是 LightRAG 服务端对应的运行时状态不可用：
+
+- `get_graph_metadata` 调用 `/graph/label/list`，依赖服务端图存储的标签列表能力。
+- `check_indexing_status` 调用 `/documents/pipeline_status`，依赖服务端共享的 `pipeline_status` 命名空间。
+- `/health` 可能仍然返回 200，因为它只能说明 Web 服务进程存活，不能保证所有图谱和管线状态接口都可用。
+
+MCP 会对这些服务端错误做降级处理：图谱标签接口失败时尝试 `/graphs?label=*`，索引状态接口失败时尝试读取 `/health` 中的 `pipeline_busy`。如果 fallback 也失败，工具会返回 `source: "graph_unavailable"` 或 `source: "health_fallback"` 以及原始错误信息，方便继续排查 LightRAG 服务端日志。
+
 ## 可用工具
 
 ### 搜索与查询
 
-- `query_knowledge_graph`：执行 RAG 查询。支持 `mix`、`local`、`global`、`hybrid`、`naive`、`bypass`。兼容旧别名：`semantic` 会映射到 `naive`，`keyword` 会映射到 `hybrid`。
+- `query_knowledge_graph`：执行 RAG 查询。默认 `auto` 智能选择策略；也支持显式传入 `mix`、`local`、`global`、`hybrid`、`naive`、`bypass`。兼容旧别名：`semantic` 会映射到 `naive`，`keyword` 会映射到 `hybrid`。
 
 ### 文档管理
 
@@ -136,6 +226,7 @@ LIGHTRAG_API_KEY_PREFIX=
 ### 系统工具
 
 - `verify_server_health`：检查 LightRAG API 是否可访问且健康。
+- `diagnose_lightrag_connection`：使用当前 MCP 配置探测公开端点和受保护端点，返回状态码、响应体摘要、认证配置和诊断结论。
 
 ## 开发
 
