@@ -1,52 +1,74 @@
 # LightRAG MCP Server
 
-A Model Context Protocol (MCP) server that enables AI assistants to interact with [LightRAG](https://github.com/HKUDS/LightRAG) knowledge graphs. Query documents, manage entities, and build semantic relationships through a standardized tool interface.
-**Optimized for Obsidian Vaults**: The built-in smart upsert and document tracking capabilities make it perfect for agents that need to sync and reason over evolving Obsidian knowledge bases.
+这是一个面向 [LightRAG](https://github.com/HKUDS/LightRAG) 的 Model Context Protocol (MCP) 服务端。它让支持 MCP 的 AI 助手可以通过标准工具接口查询 LightRAG 知识图谱、管理文档、维护实体和关系。
 
-## Features
+该项目特别适合 Obsidian 知识库同步场景：内置的智能 `upsert` 机制可以判断文档是否新增、未变化或已修改，避免重复上传和无意义的重新索引。
 
-- **Smart Updates**: Intelligent `upsert` logic that detects changes in documents, skipping redundant uploads and re-indexing only when necessary
-- **Knowledge Graph Queries**: Perform semantic, keyword, or hybrid searches across your indexed documents
-- **Document Ingestion**: Add text, files, or entire directories to your knowledge base
-- **Entity Management**: Create, update, merge, and delete entities in the graph
-- **Relationship Handling**: Define and modify connections between entities
-- **Robust Connectivity**: Automatic retry with exponential backoff for reliable API communication
-- **Flexible Configuration**: Set options via environment variables or command-line arguments
+## 功能特性
 
-## Installation
+- **智能更新**：通过 `upsert` 检测文档变化，未变化时跳过，变化后删除旧版本并重新上传。
+- **知识图谱查询**：支持当前 LightRAG 查询模式：`mix`、`local`、`global`、`hybrid`、`naive`、`bypass`。
+- **文档导入**：支持导入文本、文件和目录批量扫描。
+- **实体管理**：支持创建、修改、合并和删除知识图谱实体。
+- **关系管理**：支持创建和更新实体之间的关系。
+- **连接可靠性**：API 调用带重试和错误处理。
+- **灵活配置**：支持通过命令行参数或环境变量配置 LightRAG 服务地址和认证信息。
+
+## 安装
 
 ```bash
-# Clone the repository
+# 克隆仓库
 git clone https://github.com/enriquecatala/mcp-lightrag.git
 cd mcp-lightrag
 
-# Install dependencies
+# 安装依赖
 uv sync
 ```
 
-## Quick Start
+## 快速开始
 
-1. **Start your LightRAG server** (must be running before the MCP server)
+1. **先启动 LightRAG 服务**
 
-2. **Launch the MCP server**:
+   MCP 服务启动前，LightRAG API 必须已经运行。
+
+2. **启动 MCP 服务**
+
    ```bash
    uv run mcp-lightrag --host localhost --port 9621
    ```
 
-3. **Connect your AI assistant** via the MCP protocol (stdio transport)
+3. **在 MCP 客户端中连接**
 
-## Configuration
+   本服务默认使用 stdio transport，适合接入 Claude Desktop、Cursor、Codex 等支持 MCP 的客户端。
 
-| Option        | Environment Variable | Default     | Description       |
-| ------------- | -------------------- | ----------- | ----------------- |
-| `--host`      | `LIGHTRAG_HOST`      | `localhost` | LightRAG API host |
-| `--port`      | `LIGHTRAG_PORT`      | `9621`      | LightRAG API port |
-| `--api-key`   | `LIGHTRAG_API_KEY`   | *(none)*    | Optional API key  |
-| `--log-level` | —                    | `INFO`      | Logging verbosity |
+## 配置
 
-## Setting up as MCP Server
+| 选项 | 环境变量 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `--host` | `LIGHTRAG_HOST` | `localhost` | LightRAG API 主机 |
+| `--port` | `LIGHTRAG_PORT` | `9621` | LightRAG API 端口 |
+| `--api-key` | `LIGHTRAG_API_KEY` | 无 | 可选 API key 或 token |
+| 仅环境变量 | `LIGHTRAG_API_KEY_HEADER` | `Authorization` | 认证 header 名称，例如 `X-API-Key` |
+| 仅环境变量 | `LIGHTRAG_API_KEY_PREFIX` | `Bearer` | 认证前缀；若使用裸 API key header，可设置为空字符串 |
+| `--log-level` | 无 | `INFO` | 日志级别 |
 
-To integrate this server with an MCP client (such as Claude Desktop), add the following configuration to your `mcp-server-config.json` key in your settings file. This configuration uses `uv` to run the server from the source directory.
+默认认证方式为：
+
+```http
+Authorization: Bearer <LIGHTRAG_API_KEY>
+```
+
+如果你的 LightRAG 部署使用 `X-API-Key`，可以这样配置：
+
+```bash
+LIGHTRAG_API_KEY=your_api_key
+LIGHTRAG_API_KEY_HEADER=X-API-Key
+LIGHTRAG_API_KEY_PREFIX=
+```
+
+## 配置为 MCP Server
+
+在 MCP 客户端配置中加入如下内容。该示例使用 `uv` 从源码目录启动服务。
 
 ```json
 {
@@ -71,73 +93,83 @@ To integrate this server with an MCP client (such as Claude Desktop), add the fo
 }
 ```
 
-> **Note**: Replace `/absolute/path/to/mcp-lightrag` with the actual full path to where you cloned this repository.
+将 `/absolute/path/to/mcp-lightrag` 替换为本仓库在你机器上的绝对路径。
 
-### Smart Document Handling
-This server distinguishes itself with an intelligent **Upsert Mechanism** ideal for keeping in sync with **Obsidian Vaults** or other local knowledge bases:
-- **New File** → Uploads and indexes immediately.
-- **Unchanged File** → Detects identical content and skips (saving time and resources).
-- **Modified File** → Automatically removes the old version and indexes the new one.
-This allows agents to efficiently "watch" a folder and keep the RAG knowledge graph up-to-date without redundant processing.
+## 智能文档处理
 
-## Available Tools
+`upsert_document` 适合用于持续同步 Obsidian Vault 或其他本地知识库目录：
 
-### Search & Query
-- `query_knowledge_graph` — Execute specialized RAG queries (mix, semantic, keyword, etc.) to answer questions based on your data.
+- **新文件**：上传并交给 LightRAG 索引。
+- **未变化文件**：检测到内容长度一致后跳过，节省时间和资源。
+- **已修改文件**：删除旧文档记录，再上传新版本。
 
-### Document Management
-- `ingest_text` — Index raw text content directly into the graph.
-- `ingest_file` — Index a specific local file (absolute path required).
-- `upload_and_index` — Upload a file to the server for indexing (handles transfer).
-- `ingest_batch` — Recursively scan and index directories with pattern filtering.
-- `upsert_document` — Smart document upload: creates new, skips identical, or updates modified documents.
-- `find_document` — Search for a document by filename to check status and details.
-- `get_latest_documents` — Retrieve a paginated list of recently updated documents.
-- `list_all_docs` — List all documents in the system (warning: can be slow for large datasets).
-- `check_indexing_status` — Check if the background indexing pipeline is idle or busy.
+这种机制让 AI 助手可以高效维护一批持续变化的知识文档。
 
-### Graph Operations
-- `create_entities` — Manually insert new entities.
-- `modify_entities` — Update attributes of existing entities.
-- `remove_entities` — Delete specific entities.
-- `unify_entities` — Merge multiple entities into a single canonical entity.
-- `connect_entities` — Create or update relationships between entities.
-- `purge_by_document` — Delete a document and remove all its associated data from the graph.
-- `get_graph_metadata` — Explore the graph schema (available node labels and relationship types).
+## 可用工具
 
-### System
-- `verify_server_health` — Check if the LightRAG API is reachable and healthy.
+### 搜索与查询
 
-## Development
+- `query_knowledge_graph`：执行 RAG 查询。支持 `mix`、`local`、`global`、`hybrid`、`naive`、`bypass`。兼容旧别名：`semantic` 会映射到 `naive`，`keyword` 会映射到 `hybrid`。
+
+### 文档管理
+
+- `ingest_text`：直接将文本内容写入知识图谱。
+- `ingest_file`：索引一个本地文件，文件路径必须对 MCP 服务进程可见。
+- `upload_and_index`：上传本地文件到 LightRAG 服务端输入目录并触发索引。
+- `ingest_batch`：按目录批量导入文件，支持递归和过滤规则。
+- `upsert_document`：智能文档上传，新建、跳过或更新文档。
+- `find_document`：按文件名或路径查找文档状态和详情。
+- `get_latest_documents`：分页获取最近更新的文档。
+- `list_all_docs`：列出系统中的所有文档；文档量大时可能较慢。
+- `check_indexing_status`：检查后台索引管线是否空闲或忙碌。
+
+### 图谱操作
+
+- `create_entities`：手动创建实体。
+- `modify_entities`：更新实体属性。
+- `remove_entities`：删除指定实体。
+- `unify_entities`：将多个实体合并为一个规范实体。
+- `connect_entities`：创建或更新实体之间的关系。
+- `purge_by_document`：按文档 ID 删除文档及其关联的图谱数据。
+- `get_graph_metadata`：查看图谱元数据，例如可用标签和关系类型。
+
+### 系统工具
+
+- `verify_server_health`：检查 LightRAG API 是否可访问且健康。
+
+## 开发
 
 ```bash
-# Install dev dependencies
+# 安装开发依赖
 uv sync --all-extras
 
-# Run tests
+# 运行测试
 uv run python -m pytest
 
-# Lint code
+# 运行 lint
 uv run ruff check src/
 ```
 
-### Publishing
+## 发布
 
-To publish a new version to PyPI:
+发布新版本到 PyPI 的基本流程：
 
-1. Update the version in `pyproject.toml`.
-2. Build the package:
+1. 更新 `pyproject.toml` 中的版本号。
+2. 构建包：
+
    ```bash
    uv run python -m build
    ```
-3. Upload to PyPI (requires PyPI API token):
+
+3. 上传到 PyPI：
+
    ```bash
    uv run twine upload dist/*
    ```
 
-### Updating the Client
+## 更新生成客户端
 
-If the LightRAG API evolves, you can regenerate the client using `openapi-python-client`. Ensure your LightRAG server is running (e.g., at `http://localhost:9621`), then run:
+当 LightRAG API 发生变化时，可以使用 `openapi-python-client` 重新生成客户端代码。确保 LightRAG 服务正在运行，例如 `http://localhost:9621`，然后执行：
 
 ```bash
 uv tool run openapi-python-client generate \
@@ -147,8 +179,8 @@ uv tool run openapi-python-client generate \
   --overwrite
 ```
 
-This will update the client code in `src/mcp_lightrag/client/light_rag_server_api_client` based on the latest OpenAPI specification.
+该命令会根据最新 OpenAPI 规范更新 `src/mcp_lightrag/client/light_rag_server_api_client` 下的生成代码。
 
-## License
+## 许可证
 
 MIT
