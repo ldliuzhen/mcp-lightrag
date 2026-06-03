@@ -24,6 +24,15 @@ QUERY_MODE_ALIASES = {
     "keyword": "hybrid",
 }
 
+AUTO_QUERY_MODES = {"auto", "自动", "智能"}
+
+DEFAULT_QUERY_USER_PROMPT = (
+    "Please answer in the same language as the question. "
+    "Use only the retrieved context. If the context contains relevant facts, "
+    "synthesize them into a direct answer and cite the evidence implicitly in the response. "
+    "Only say that there is insufficient information when the retrieved context is truly unrelated."
+)
+
 class AppContext:
     """Type-safe application context."""
     def __init__(self, client: LightRAGApiClient):
@@ -70,26 +79,31 @@ def normalize_query_mode(search_mode: str) -> QueryRequestMode:
         valid_modes = ", ".join(mode.value for mode in QueryRequestMode)
         raise ValueError(f"Unsupported search_mode '{search_mode}'. Use one of: {valid_modes}") from exc
 
-# --- Search & Query Tools ---
+def plan_auto_query_modes(prompt: str) -> List[QueryRequestMode]:
+    """Pick a small query-mode sequence from the question shape."""
+    text = prompt.lower()
+    graph_terms = ["关系", "关联", "实体", "图谱", "路径", "连接", "relationship", "entity", "graph"]
+    broad_terms = ["总结", "概括", "有哪些", "影响", "趋势", "对比", "总体", "why", "compare", "summarize"]
+    exact_terms = ["原文", "出处", "片段", "包含", "关键词", "quote", "source", "snippet"]
 
-@mcp.tool(name="query_knowledge_graph", description="Search the knowledge graph for information using various strategies. Ideal for answering questions based on indexed data.")
-@format_output
-async def query_knowledge_graph(
-    ctx: Context,
-    prompt: str = Field(description="The question or search query to execute against the knowledge base"),
-    search_mode: str = Field(
-        description="Search strategy to use: 'mix' (recommended), 'local', 'global', 'hybrid', 'naive' (vector-only), or 'bypass'. Deprecated aliases: 'semantic' -> 'naive', 'keyword' -> 'hybrid'.",
-        default="mix"
-    ),
-    limit: int = Field(description="Maximum number of result items/paragraphs to retrieve", default=60),
-    context_only: bool = Field(description="If True, returns only the raw context data without LLM generation", default=False),
-    prompt_only: bool = Field(description="If True, returns only the constructed LLM prompt without executing it to the LLM", default=False),
-) -> Any:
-    """Execute a RAG query against the knowledge graph."""
-    api = await get_api(ctx)
-    params = QueryRequest(
+    if any(term in text for term in graph_terms):
+        return [QueryRequestMode.LOCAL, QueryRequestMode.MIX, QueryRequestMode.GLOBAL, QueryRequestMode.NAIVE]
+    if any(term in text for term in broad_terms):
+        return [QueryRequestMode.GLOBAL, QueryRequestMode.MIX, QueryRequestMode.HYBRID, QueryRequestMode.NAIVE]
+    if any(term in text for term in exact_terms):
+        return [QueryRequestMode.NAIVE, QueryRequestMode.HYBRID, QueryRequestMode.MIX]
+    return [QueryRequestMode.MIX, QueryRequestMode.LOCAL, QueryRequestMode.GLOBAL, QueryRequestMode.NAIVE]
+
+def build_query_request(
+    prompt: str,
+    mode: QueryRequestMode,
+    limit: int,
+    context_only: bool,
+    prompt_only: bool
+) -> QueryRequest:
+    return QueryRequest(
         query=prompt,
-        mode=normalize_query_mode(search_mode),
+        mode=mode,
         top_k=limit,
         chunk_top_k=limit,
         only_need_context=context_only,
@@ -98,10 +112,97 @@ async def query_knowledge_graph(
         max_entity_tokens=4096,
         max_relation_tokens=4096,
         max_total_tokens=12288,
+        user_prompt=DEFAULT_QUERY_USER_PROMPT,
         stream=False,
         include_references=True
     )
-    return await api.query(params)
+
+def serialize_api_result(result: Any) -> Any:
+    if hasattr(result, "to_dict"):
+        return result.to_dict()
+    return result
+
+def extract_response_text(result: Any) -> str:
+    data = serialize_api_result(result)
+    if isinstance(data, dict):
+        value = data.get("response") or data.get("message") or data
+        return str(value)
+    return str(data)
+
+def looks_insufficient_answer(text: str) -> bool:
+    lowered = text.lower()
+    markers = [
+        "暂无足够信息",
+        "没有足够信息",
+        "未找到足够",
+        "没有找到相关",
+        "无法根据",
+        "无法回答",
+        "insufficient information",
+        "not enough information",
+        "no sufficient information",
+        "do not have enough",
+        "cannot answer",
+        "i'm sorry",
+    ]
+    return any(marker in lowered for marker in markers)
+
+# --- Search & Query Tools ---
+
+@mcp.tool(name="query_knowledge_graph", description="Search the LightRAG knowledge base. The calling model may choose search_mode directly: use mix for general Q&A, local for entity/relationship questions, global for summaries/comparisons, hybrid for keyword+vector search, naive for source/snippet lookup, bypass to skip retrieval, or auto when unsure.")
+@format_output
+async def query_knowledge_graph(
+    ctx: Context,
+    prompt: str = Field(description="The question or search query to execute against the knowledge base"),
+    search_mode: str = Field(
+        description="Search strategy. Use 'auto' by default, or let the calling model choose: 'mix' for normal answers, 'local' for entity/relationship/path questions, 'global' for summaries/comparisons, 'hybrid' for keyword+semantic search, 'naive' for raw text/source lookup, 'bypass' to skip retrieval. Deprecated aliases: 'semantic' -> 'naive', 'keyword' -> 'hybrid'.",
+        default="auto"
+    ),
+    limit: int = Field(description="Maximum number of result items/paragraphs to retrieve", default=60),
+    context_only: bool = Field(description="If True, returns only the raw context data without LLM generation", default=False),
+    prompt_only: bool = Field(description="If True, returns only the constructed LLM prompt without executing it to the LLM", default=False),
+) -> Any:
+    """Execute a RAG query against the knowledge graph."""
+    api = await get_api(ctx)
+    normalized_mode = search_mode.strip().lower()
+    if normalized_mode not in AUTO_QUERY_MODES:
+        params = build_query_request(
+            prompt,
+            normalize_query_mode(search_mode),
+            limit,
+            context_only,
+            prompt_only
+        )
+        return await api.query(params)
+
+    attempts = []
+    last_result = None
+    for mode in plan_auto_query_modes(prompt):
+        params = build_query_request(prompt, mode, limit, context_only, prompt_only)
+        result = await api.query(params)
+        last_result = result
+        response_text = extract_response_text(result)
+        insufficient = looks_insufficient_answer(response_text)
+        attempts.append({
+            "mode": mode.value,
+            "insufficient": insufficient,
+            "preview": response_text[:300],
+        })
+
+        if context_only or prompt_only or not insufficient:
+            return {
+                "selected_mode": mode.value,
+                "strategy": "auto",
+                "attempts": attempts,
+                "result": serialize_api_result(result),
+            }
+
+    return {
+        "selected_mode": attempts[-1]["mode"] if attempts else None,
+        "strategy": "auto",
+        "attempts": attempts,
+        "result": serialize_api_result(last_result),
+    }
 
 # --- Document Management Tools ---
 
@@ -219,6 +320,12 @@ async def get_graph_metadata(ctx: Context) -> Any:
 async def verify_server_health(ctx: Context) -> Any:
     api = await get_api(ctx)
     return await api.check_health()
+
+@mcp.tool(name="diagnose_lightrag_connection", description="Diagnose LightRAG connectivity, auth, and protected API availability using the current MCP configuration.")
+@format_output
+async def diagnose_lightrag_connection(ctx: Context) -> Any:
+    api = await get_api(ctx)
+    return await api.diagnose_connection()
 
 # --- Entity & Relationship Management ---
 

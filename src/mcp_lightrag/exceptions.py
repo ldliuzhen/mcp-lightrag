@@ -13,9 +13,14 @@ class APIConnectionError(LightRAGError):
 class APIResponseError(LightRAGError):
     """Raised when the API returns an error response."""
     def __init__(self, message: str, status_code: int = None, details: str = None):
-        super().__init__(message)
         self.status_code = status_code
         self.details = details
+        full_message = message
+        if status_code is not None:
+            full_message = f"{full_message} (HTTP {status_code})"
+        if details:
+            full_message = f"{full_message}: {details}"
+        super().__init__(full_message)
 
 class ConfigurationError(LightRAGError):
     """Raised when there is a configuration-related issue."""

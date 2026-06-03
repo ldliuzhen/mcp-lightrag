@@ -10,13 +10,23 @@ class ServerSettings:
     """Settings for the LightRAG API connection."""
     host: str = "localhost"
     port: int = 9621
+    url: str = ""
     api_key: str = ""
-    api_key_header: str = "Authorization"
-    api_key_prefix: str = "Bearer"
+    api_key_header: str = "X-API-Key"
+    api_key_prefix: str = ""
+    username: str = ""
+    password: str = ""
     
     @property
     def base_url(self) -> str:
-        return f"http://{self.host}:{self.port}"
+        if self.url:
+            return self.url.rstrip("/")
+
+        host = self.host.strip().rstrip("/")
+        if host.startswith(("http://", "https://")):
+            return host
+
+        return f"http://{host}:{self.port}"
 
 @dataclass
 class QueryParams:

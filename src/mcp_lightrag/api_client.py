@@ -40,6 +40,7 @@ from .client.light_rag_server_api_client.api.graph.create_relation_graph_relatio
 from .client.light_rag_server_api_client.api.graph.update_entity_graph_entity_edit_post import asyncio as async_edit_entity
 from .client.light_rag_server_api_client.api.graph.update_relation_graph_relation_edit_post import asyncio as async_edit_relation
 from .client.light_rag_server_api_client.api.graph.get_graph_labels_graph_label_list_get import asyncio as async_get_graph_labels
+from .client.light_rag_server_api_client.api.graph.get_knowledge_graph_graphs_get import asyncio as async_get_knowledge_graph
 from .client.light_rag_server_api_client.api.graph.merge_entities_graph_entities_merge_post import asyncio as async_merge_entities
 
 # Query
@@ -73,6 +74,7 @@ from .client.light_rag_server_api_client.errors import UnexpectedStatus
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+RECOVERABLE_SERVER_STATUSES = {500, 503}
 
 def with_retry(max_retries: int = 3, base_delay: float = 1.0):
     """
@@ -115,16 +117,17 @@ class LightRAGApiClient:
         Initialize the client with provided settings.
         """
         self.settings = settings
+        self._runtime_token = settings.api_key
+        self._runtime_auth_header = settings.api_key_header
+        self._runtime_auth_prefix = settings.api_key_prefix
+        self._login_attempted = False
         # Use AuthenticatedClient only if api_key is provided, otherwise use Client
         # This avoids sending invalid 'Bearer ' header when auth is disabled
         if settings.api_key:
-            self.client = AuthenticatedClient(
-                base_url=settings.base_url, 
-                token=settings.api_key, 
-                prefix=settings.api_key_prefix,
-                auth_header_name=settings.api_key_header,
-                verify_ssl=False,
-                raise_on_unexpected_status=True
+            self.client = self._new_authenticated_client(
+                settings.api_key,
+                settings.api_key_header,
+                settings.api_key_prefix
             )
         else:
             from .client.light_rag_server_api_client.client import Client
@@ -134,6 +137,16 @@ class LightRAGApiClient:
                 raise_on_unexpected_status=True
             )
         logger.info(f"Connected to LightRAG API at {settings.base_url}")
+
+    def _new_authenticated_client(self, token: str, header: str, prefix: str) -> AuthenticatedClient:
+        return AuthenticatedClient(
+            base_url=self.settings.base_url,
+            token=token,
+            prefix=prefix,
+            auth_header_name=header,
+            verify_ssl=False,
+            raise_on_unexpected_status=True
+        )
 
     async def close(self):
         """Clean up resources."""
@@ -145,17 +158,32 @@ class LightRAGApiClient:
         """Helper to execute API operations with logging and retries."""
         try:
             logger.debug(f"Starting operation: {name}")
+            if name != "health_check":
+                await self._ensure_login_token()
             result = await api_func(client=self.client, **kwargs)
             self._raise_for_error_response(result, name)
             return result
         except APIResponseError:
             raise
         except UnexpectedStatus as e:
-            logger.error(f"API Error ({name}): {e.status_code} - {e.content!r}")
-            raise APIResponseError(f"API operation '{name}' failed", status_code=e.status_code, details=str(e.content))
+            details = e.content.decode("utf-8", errors="replace")
+            logger.error(f"API Error ({name}): {e.status_code} - {details}")
+            hint = ""
+            if e.status_code in [401, 403]:
+                hint = (
+                    ". Authentication failed; check LIGHTRAG_API_KEY, "
+                    "LIGHTRAG_API_KEY_HEADER and LIGHTRAG_API_KEY_PREFIX"
+                )
+            raise APIResponseError(
+                f"API operation '{name}' failed{hint}",
+                status_code=e.status_code,
+                details=details
+            )
         except httpx.RequestError as e:
-            logger.error(f"Unexpected error during {name}: {str(e)}")
-            raise APIConnectionError(f"Failed to connect for '{name}'") from e
+            logger.error(f"Connection error during {name} at {self.settings.base_url}: {str(e)}")
+            raise APIConnectionError(
+                f"Failed to connect for '{name}' at {self.settings.base_url}: {e}"
+            ) from e
         except Exception:
             logger.exception(f"Unexpected error during {name}")
             raise
@@ -280,7 +308,35 @@ class LightRAGApiClient:
 
     async def get_pipeline_status(self) -> Any:
         """Check the status of the indexing pipeline."""
-        return await self._execute_op(async_get_pipeline_status, "pipeline_status")
+        try:
+            return await self._execute_op(async_get_pipeline_status, "pipeline_status")
+        except APIResponseError as e:
+            if e.status_code not in RECOVERABLE_SERVER_STATUSES:
+                raise
+
+            try:
+                health = await self.check_health()
+                health_data = health.to_dict() if hasattr(health, "to_dict") else health
+                busy = health_data.get("pipeline_busy") if isinstance(health_data, dict) else None
+            except Exception as health_error:
+                health_data = None
+                busy = None
+                health_error_text = str(health_error)
+            else:
+                health_error_text = None
+
+            return {
+                "status": "unavailable",
+                "source": "health_fallback",
+                "busy": busy,
+                "message": (
+                    f"Pipeline status endpoint returned HTTP {e.status_code}; "
+                    "using /health fallback when available."
+                ),
+                "error": str(e),
+                "health_error": health_error_text,
+                "health": health_data,
+            }
 
     async def scan_inputs(self) -> Any:
         """Trigger a scan for new files in the inputs directory."""
@@ -347,7 +403,65 @@ class LightRAGApiClient:
 
     async def get_labels(self) -> Any:
         """Get labels from the knowledge graph."""
-        return await self._execute_op(async_get_graph_labels, "get_labels")
+        try:
+            return await self._execute_op(async_get_graph_labels, "get_labels")
+        except APIResponseError as e:
+            if e.status_code not in RECOVERABLE_SERVER_STATUSES:
+                raise
+
+            try:
+                graph = await self._execute_op(
+                    async_get_knowledge_graph,
+                    "get_graph_fallback",
+                    label="*",
+                    max_depth=3,
+                    max_nodes=1000
+                )
+            except Exception as fallback_error:
+                return {
+                    "source": "graph_unavailable",
+                    "message": (
+                        f"Graph label endpoint returned HTTP {e.status_code}; "
+                        "/graphs fallback also failed."
+                    ),
+                    "labels": [],
+                    "error": str(e),
+                    "fallback_error": str(fallback_error),
+                }
+
+            return {
+                "source": "graphs_fallback",
+                "message": (
+                    f"Graph label endpoint returned HTTP {e.status_code}; "
+                    "returned /graphs data instead."
+                ),
+                "labels": self._extract_graph_labels(graph),
+                "graph": graph,
+            }
+
+    @staticmethod
+    def _extract_graph_labels(graph: Any) -> List[str]:
+        """Best-effort label extraction from varying /graphs response shapes."""
+        labels = set()
+        if not isinstance(graph, dict):
+            return []
+
+        nodes = graph.get("nodes")
+        if nodes is None and isinstance(graph.get("data"), dict):
+            nodes = graph["data"].get("nodes")
+
+        if isinstance(nodes, list):
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                value = node.get("label") or node.get("entity_type") or node.get("type")
+                if isinstance(value, str):
+                    labels.add(value)
+                values = node.get("labels")
+                if isinstance(values, list):
+                    labels.update(str(item) for item in values)
+
+        return sorted(labels)
 
     async def create_entity(
         self,
@@ -473,6 +587,140 @@ class LightRAGApiClient:
     async def check_health(self) -> Any:
         """Check if the LightRAG service is healthy."""
         return await self._execute_op(async_get_health, "health_check")
+
+    def _auth_headers(self) -> Dict[str, str]:
+        """Build auth headers without exposing the secret in diagnostics."""
+        if not self._runtime_token:
+            return {}
+        value = (
+            f"{self._runtime_auth_prefix} {self._runtime_token}"
+            if self._runtime_auth_prefix
+            else self._runtime_token
+        )
+        return {self._runtime_auth_header: value}
+
+    async def _ensure_login_token(self) -> None:
+        """Use username/password to obtain a Bearer token when no API key is configured."""
+        if self._runtime_token or not (self.settings.username and self.settings.password):
+            return
+        if self._login_attempted:
+            return
+
+        self._login_attempted = True
+        async with httpx.AsyncClient(
+            base_url=self.settings.base_url,
+            verify=False,
+            timeout=10.0
+        ) as client:
+            response = await client.post(
+                "/login",
+                data={
+                    "username": self.settings.username,
+                    "password": self.settings.password,
+                    "grant_type": "password",
+                },
+            )
+
+        if response.status_code != 200:
+            raise APIResponseError(
+                "LightRAG login failed",
+                status_code=response.status_code,
+                details=response.text
+            )
+
+        payload = response.json()
+        token = payload.get("access_token") or payload.get("token")
+        if not token:
+            raise APIResponseError(
+                "LightRAG login response did not include an access token",
+                status_code=response.status_code,
+                details=str(payload)
+            )
+
+        self._runtime_token = token
+        self._runtime_auth_header = "Authorization"
+        self._runtime_auth_prefix = (payload.get("token_type") or "Bearer").capitalize()
+        self.client = self._new_authenticated_client(
+            self._runtime_token,
+            self._runtime_auth_header,
+            self._runtime_auth_prefix
+        )
+
+    async def diagnose_connection(self) -> Dict[str, Any]:
+        """Probe public and protected endpoints using the current MCP configuration."""
+        login_error = None
+        try:
+            await self._ensure_login_token()
+        except APIResponseError as e:
+            login_error = str(e)
+        headers = self._auth_headers()
+
+        async def probe(method: str, path: str, **kwargs) -> Dict[str, Any]:
+            try:
+                async with httpx.AsyncClient(
+                    base_url=self.settings.base_url,
+                    verify=False,
+                    timeout=10.0,
+                    headers=headers
+                ) as client:
+                    response = await client.request(method, path, **kwargs)
+                body = response.text
+                return {
+                    "status_code": response.status_code,
+                    "reason": response.reason_phrase,
+                    "content_type": response.headers.get("content-type"),
+                    "body": body[:1000],
+                }
+            except httpx.RequestError as e:
+                return {
+                    "status_code": None,
+                    "reason": "request_error",
+                    "error": str(e),
+                }
+
+        health = await probe("GET", "/health")
+        pipeline = await probe("GET", "/documents/pipeline_status")
+        paginated = await probe(
+            "POST",
+            "/documents/paginated",
+            json={"page": 1, "page_size": 10, "sort_field": "updated_at", "sort_direction": "desc"}
+        )
+        graph_labels = await probe("GET", "/graph/label/list")
+        graph_data = await probe("GET", "/graphs", params={"label": "*", "max_depth": 3, "max_nodes": 1000})
+
+        diagnosis = "unknown"
+        protected_status = pipeline.get("status_code")
+        if health.get("status_code") != 200:
+            diagnosis = "base_url_or_service_unreachable"
+        elif login_error:
+            diagnosis = "login_failed"
+        elif protected_status in [401, 403]:
+            diagnosis = "authentication_failed_or_missing"
+        elif protected_status == 503 or paginated.get("status_code") == 503:
+            diagnosis = "protected_api_service_unavailable"
+        elif graph_labels.get("status_code") == 503 and graph_data.get("status_code") == 200:
+            diagnosis = "graph_label_endpoint_unavailable_use_graphs_fallback"
+        elif protected_status and 200 <= protected_status < 300:
+            diagnosis = "connection_and_auth_ok"
+
+        return {
+            "base_url": self.settings.base_url,
+            "auth": {
+                "configured": bool(self._runtime_token or (self.settings.username and self.settings.password)),
+                "method": "api_key" if self.settings.api_key else ("login" if self.settings.username else None),
+                "header": self._runtime_auth_header if self._runtime_token else None,
+                "prefix": self._runtime_auth_prefix if self._runtime_token else None,
+                "login_error": login_error,
+            },
+            "diagnosis": diagnosis,
+            "probes": {
+                "health": health,
+                "pipeline_status": pipeline,
+                "documents_paginated": paginated,
+                "graph_label_list": graph_labels,
+                "graphs": graph_data,
+            },
+        }
 
     async def upsert_document(self, file_path: Union[str, Path]) -> Dict[str, Any]:
         """
