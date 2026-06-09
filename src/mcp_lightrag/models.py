@@ -33,14 +33,14 @@ class QueryParams:
     """Parameters for document queries."""
     query: str
     mode: str = "mix"
-    top_k: int = 60
-    chunk_top_k: int = 60
+    top_k: int = 10
+    chunk_top_k: int = 10
     only_need_context: bool = False
     only_need_prompt: bool = False
     response_type: str = "Multiple Paragraphs"
     max_entity_tokens: int = 4096
     max_relation_tokens: int = 4096
-    max_total_tokens: int = 12288
+    max_total_tokens: int = 6656
     hl_keywords: List[str] = field(default_factory=list)
     ll_keywords: List[str] = field(default_factory=list)
     conversation_history: List[Dict[str, Any]] = field(default_factory=list)

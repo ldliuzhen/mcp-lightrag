@@ -25,6 +25,10 @@ QUERY_MODE_ALIASES = {
 }
 
 AUTO_QUERY_MODES = {"auto", "自动", "智能"}
+DEFAULT_QUERY_LIMIT = 10
+MAX_GENERATION_QUERY_LIMIT = 10
+MAX_CONTEXT_QUERY_LIMIT = 30
+AUTO_QUERY_MAX_ATTEMPTS = 2
 
 DEFAULT_QUERY_USER_PROMPT = (
     "Please answer in the same language as the question. "
@@ -94,13 +98,37 @@ def plan_auto_query_modes(prompt: str) -> List[QueryRequestMode]:
         return [QueryRequestMode.NAIVE, QueryRequestMode.HYBRID, QueryRequestMode.MIX]
     return [QueryRequestMode.MIX, QueryRequestMode.LOCAL, QueryRequestMode.GLOBAL, QueryRequestMode.NAIVE]
 
+def resolve_query_limit(limit: int, context_only: bool, prompt_only: bool) -> tuple[int, Dict[str, Any]]:
+    """Keep LightRAG calls inside typical MCP client timeouts."""
+    requested = max(1, int(limit))
+    max_limit = MAX_CONTEXT_QUERY_LIMIT if context_only or prompt_only else MAX_GENERATION_QUERY_LIMIT
+    applied = min(requested, max_limit)
+    return applied, {
+        "requested_limit": requested,
+        "applied_limit": applied,
+        "max_limit": max_limit,
+        "limit_was_reduced": applied != requested,
+        "reason": (
+            "Generated RAG answers are capped to avoid MCP client request timeouts. "
+            "Use context_only=true for larger raw-context retrieval."
+            if applied != requested
+            else None
+        ),
+    }
+
 def build_query_request(
     prompt: str,
     mode: QueryRequestMode,
     limit: int,
     context_only: bool,
-    prompt_only: bool
+    prompt_only: bool,
+    include_references: bool
 ) -> QueryRequest:
+    token_scale = max(1, min(limit, MAX_GENERATION_QUERY_LIMIT))
+    max_entity_tokens = 1024 + token_scale * 128
+    max_relation_tokens = 1024 + token_scale * 128
+    max_total_tokens = 4096 + token_scale * 256
+
     return QueryRequest(
         query=prompt,
         mode=mode,
@@ -109,12 +137,12 @@ def build_query_request(
         only_need_context=context_only,
         only_need_prompt=prompt_only,
         response_type="Multiple Paragraphs",
-        max_entity_tokens=4096,
-        max_relation_tokens=4096,
-        max_total_tokens=12288,
+        max_entity_tokens=max_entity_tokens,
+        max_relation_tokens=max_relation_tokens,
+        max_total_tokens=max_total_tokens,
         user_prompt=DEFAULT_QUERY_USER_PROMPT,
         stream=False,
-        include_references=True
+        include_references=include_references
     )
 
 def serialize_api_result(result: Any) -> Any:
@@ -158,27 +186,44 @@ async def query_knowledge_graph(
         description="Search strategy. Use 'auto' by default, or let the calling model choose: 'mix' for normal answers, 'local' for entity/relationship/path questions, 'global' for summaries/comparisons, 'hybrid' for keyword+semantic search, 'naive' for raw text/source lookup, 'bypass' to skip retrieval. Deprecated aliases: 'semantic' -> 'naive', 'keyword' -> 'hybrid'.",
         default="auto"
     ),
-    limit: int = Field(description="Maximum number of result items/paragraphs to retrieve", default=60),
+    limit: int = Field(description="Maximum number of result items/paragraphs to retrieve. Generated answers are capped at 10 to avoid MCP client timeouts; use context_only=True for larger raw-context retrieval.", default=DEFAULT_QUERY_LIMIT),
     context_only: bool = Field(description="If True, returns only the raw context data without LLM generation", default=False),
     prompt_only: bool = Field(description="If True, returns only the constructed LLM prompt without executing it to the LLM", default=False),
+    include_references: bool = Field(description="If True, includes LightRAG reference metadata in the response. Keep False for faster MCP calls.", default=False),
 ) -> Any:
     """Execute a RAG query against the knowledge graph."""
     api = await get_api(ctx)
+    effective_limit, limit_info = resolve_query_limit(limit, context_only, prompt_only)
     normalized_mode = search_mode.strip().lower()
     if normalized_mode not in AUTO_QUERY_MODES:
         params = build_query_request(
             prompt,
             normalize_query_mode(search_mode),
-            limit,
+            effective_limit,
             context_only,
-            prompt_only
+            prompt_only,
+            include_references
         )
-        return await api.query(params)
+        result = await api.query(params)
+        if limit_info["limit_was_reduced"]:
+            return {
+                "strategy": normalize_query_mode(search_mode).value,
+                "limit": limit_info,
+                "result": serialize_api_result(result),
+            }
+        return result
 
     attempts = []
     last_result = None
-    for mode in plan_auto_query_modes(prompt):
-        params = build_query_request(prompt, mode, limit, context_only, prompt_only)
+    for mode in plan_auto_query_modes(prompt)[:AUTO_QUERY_MAX_ATTEMPTS]:
+        params = build_query_request(
+            prompt,
+            mode,
+            effective_limit,
+            context_only,
+            prompt_only,
+            include_references
+        )
         result = await api.query(params)
         last_result = result
         response_text = extract_response_text(result)
@@ -193,6 +238,7 @@ async def query_knowledge_graph(
             return {
                 "selected_mode": mode.value,
                 "strategy": "auto",
+                "limit": limit_info,
                 "attempts": attempts,
                 "result": serialize_api_result(result),
             }
@@ -200,6 +246,7 @@ async def query_knowledge_graph(
     return {
         "selected_mode": attempts[-1]["mode"] if attempts else None,
         "strategy": "auto",
+        "limit": limit_info,
         "attempts": attempts,
         "result": serialize_api_result(last_result),
     }
