@@ -131,6 +131,8 @@ uv run mcp-lightrag --url http://server-ip:9621
 
 `query_knowledge_graph` 的 `search_mode` 默认值是 `auto`。在这个模式下，MCP 会根据问题类型选择一组 LightRAG 查询模式，并在返回“暂无足够信息”等保守回答时自动换下一个模式重试。
 
+为避免 MCP 客户端等待 LightRAG 检索和生成过久导致 `Request timed out`，`query_knowledge_graph` 面向 LLM 生成答案时默认 `limit=10`，并会把更大的 `limit` 自动降到 10。需要一次性查看更多原始上下文时，设置 `context_only=true`；这种模式最多返回 30 条上下文，不触发 LightRAG 的最终回答生成。
+
 调用方大模型也可以自行指定查询策略：
 
 - `mix`：通用问答，优先推荐给大多数问题。
